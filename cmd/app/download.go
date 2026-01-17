@@ -3,11 +3,13 @@ package app
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -68,22 +70,31 @@ func (d *CourseDownload) Download() error {
 		}
 		downloadData := extractDownloadData(course, articles, d.AID, 1, d.IsOrder)
 		errs := make([]error, 0)
+		var errLock sync.Mutex
 
 		path, err := utils.Mkdir(OutputDir, utils.FileName(course.ClassInfo.Name, ""), "MP3")
 		if err != nil {
 			return err
 		}
 
+		// 3 路并发下载 MP3
+		wgp := utils.NewWaitGroupPool(3)
 		for _, datum := range downloadData.Data {
 			if !datum.IsCanDL {
 				continue
 			}
-			stream := datum.Enid
-			if err := downloader.Download(datum, stream, path); err != nil {
-				errs = append(errs, err)
-			}
-
+			wgp.Add()
+			go func(datum downloader.Datum) {
+				defer wgp.Done()
+				stream := datum.Enid
+				if err := downloader.Download(datum, stream, path); err != nil {
+					errLock.Lock()
+					errs = append(errs, err)
+					errLock.Unlock()
+				}
+			}(datum)
 		}
+		wgp.Wait()
 		if len(errs) > 0 {
 			return errs[0]
 		}
@@ -149,19 +160,29 @@ func (d *OdobDownload) Download() error {
 		downloadData.Type = "audio"
 		downloadData.Data = extractOdobDownloadData(d.ID, article)
 		errs := make([]error, 0)
+		var errLock sync.Mutex
 		path, err := utils.Mkdir(OutputDir, utils.FileName(fileName, ""), "MP3")
 		if err != nil {
 			return err
 		}
+		// 3 路并发下载 MP3
+		wgp := utils.NewWaitGroupPool(3)
 		for _, datum := range downloadData.Data {
 			if !datum.IsCanDL {
 				continue
 			}
-			stream := datum.Enid
-			if err := downloader.Download(datum, stream, path); err != nil {
-				errs = append(errs, err)
-			}
+			wgp.Add()
+			go func(datum downloader.Datum) {
+				defer wgp.Done()
+				stream := datum.Enid
+				if err := downloader.Download(datum, stream, path); err != nil {
+					errLock.Lock()
+					errs = append(errs, err)
+					errLock.Unlock()
+				}
+			}(datum)
 		}
+		wgp.Wait()
 		if len(errs) > 0 {
 			return errs[0]
 		}
@@ -620,13 +641,22 @@ func DownloadMarkdownCourse(d *CourseDownload, path string) error {
 	if err != nil {
 		return err
 	}
-	name, fileName := "", ""
-	mName, mFileName := "", ""
+
+	// 如果开启合集，保持串行以保证顺序
 	if d.IsMerge {
-		mName = utils.FileName(d.ClassName+"-合集", "md")
-		mFileName = filepath.Join(path, mName)
-		fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】\n", mFileName)
+		return downloadMarkdownSerial(d, list, path)
 	}
+
+	// 否则使用 3 路并发下载
+	return downloadMarkdownConcurrent(d, list, path)
+}
+
+// downloadMarkdownSerial 串行下载 Markdown（用于合集模式）
+func downloadMarkdownSerial(d *CourseDownload, list *services.ArticleList, path string) error {
+	mName := utils.FileName(d.ClassName+"-合集", "md")
+	mFileName := filepath.Join(path, mName)
+	fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】\n", mFileName)
+
 	for _, v := range list.List {
 		if d.AID > 0 && v.ID != d.AID {
 			continue
@@ -636,7 +666,6 @@ func DownloadMarkdownCourse(d *CourseDownload, path string) error {
 			fmt.Println(err.Error())
 			return err
 		}
-		// fmt.Printf("%#v\n", detail)
 
 		var content []services.Content
 		err = jsoniter.UnmarshalFromString(detail.Content, &content)
@@ -644,11 +673,11 @@ func DownloadMarkdownCourse(d *CourseDownload, path string) error {
 			return err
 		}
 
-		name = utils.FileName(v.Title, "md")
+		name := utils.FileName(v.Title, "md")
 		if d.IsOrder {
 			name = fmt.Sprintf("%03d.%s", v.OrderNum, name)
 		}
-		fileName = filepath.Join(path, name)
+		fileName := filepath.Join(path, name)
 		fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 ", name)
 		_, exist, err := utils.FileSize(fileName)
 
@@ -664,7 +693,6 @@ func DownloadMarkdownCourse(d *CourseDownload, path string) error {
 
 		res := ContentsToMarkdown(content)
 		if d.IsComment {
-			// 添加留言
 			commentList, err := ArticleCommentList(enId, "like", 1, 20)
 			if err == nil {
 				res += articleCommentsToMarkdown(commentList.List)
@@ -685,24 +713,122 @@ func DownloadMarkdownCourse(d *CourseDownload, path string) error {
 			return err
 		}
 		fmt.Printf("\033[32;1m%s\033[0m\n", "完成")
-		if d.IsMerge {
-			f, err := os.OpenFile(mFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+
+		// 写入合集
+		f, err = os.OpenFile(mFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Printf("\033[31;1m%s\033[0m\n", "合集失败"+err.Error())
+			return err
+		}
+		_, err = f.WriteString(res)
+		if err != nil {
+			fmt.Printf("\033[31;1m%s\033[0m\n", "合集失败"+err.Error())
+			return err
+		}
+		if err = f.Close(); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("\033[32;1m%s\033[0m\n", "合集完成")
+	return nil
+}
+
+// downloadMarkdownConcurrent 并发下载 Markdown（5 路并发 + 随机延迟）
+func downloadMarkdownConcurrent(d *CourseDownload, list *services.ArticleList, path string) error {
+	var errs []error
+	var errLock sync.Mutex
+
+	// 5 路并发下载
+	wgp := utils.NewWaitGroupPool(5)
+
+	for _, v := range list.List {
+		if d.AID > 0 && v.ID != d.AID {
+			continue
+		}
+
+		wgp.Add()
+		go func(article services.ArticleIntro) {
+			defer wgp.Done()
+
+			// 随机延迟 0-100ms，错开 API 请求时机
+			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+
+			// 构建文件名
+			name := utils.FileName(article.Title, "md")
+			if d.IsOrder {
+				name = fmt.Sprintf("%03d.%s", article.OrderNum, name)
+			}
+			fileName := filepath.Join(path, name)
+
+			// 检查文件是否已存在
+			_, exist, err := utils.FileSize(fileName)
 			if err != nil {
-				fmt.Printf("\033[31;1m%s\033[0m\n", "合集失败"+err.Error())
-				return err
+				fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 \033[31;1m失败%s\033[0m\n", name, err.Error())
+				errLock.Lock()
+				errs = append(errs, err)
+				errLock.Unlock()
+				return
+			}
+			if exist {
+				fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 \033[33;1m已存在\033[0m\n", name)
+				return
+			}
+
+			// 获取文章详情
+			detail, enId, err := ArticleDetail(d.ID, article.ID)
+			if err != nil {
+				fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 \033[31;1m失败%s\033[0m\n", name, err.Error())
+				errLock.Lock()
+				errs = append(errs, err)
+				errLock.Unlock()
+				return
+			}
+
+			var content []services.Content
+			err = jsoniter.UnmarshalFromString(detail.Content, &content)
+			if err != nil {
+				fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 \033[31;1m失败%s\033[0m\n", name, err.Error())
+				errLock.Lock()
+				errs = append(errs, err)
+				errLock.Unlock()
+				return
+			}
+
+			res := ContentsToMarkdown(content)
+			if d.IsComment {
+				commentList, err := ArticleCommentList(enId, "like", 1, 20)
+				if err == nil {
+					res += articleCommentsToMarkdown(commentList.List)
+				}
+			}
+
+			// 写入文件
+			f, err := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err != nil {
+				fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 \033[31;1m失败%s\033[0m\n", name, err.Error())
+				errLock.Lock()
+				errs = append(errs, err)
+				errLock.Unlock()
+				return
 			}
 			_, err = f.WriteString(res)
 			if err != nil {
-				fmt.Printf("\033[31;1m%s\033[0m\n", "合集失败"+err.Error())
-				return err
+				f.Close()
+				fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 \033[31;1m失败%s\033[0m\n", name, err.Error())
+				errLock.Lock()
+				errs = append(errs, err)
+				errLock.Unlock()
+				return
 			}
-			if err = f.Close(); err != nil {
-				return err
-			}
-		}
+			f.Close()
+			fmt.Printf("正在生成文件：【\033[37;1m%s\033[0m】 \033[32;1m完成\033[0m\n", name)
+		}(v)
 	}
-	if d.IsMerge {
-		fmt.Printf("\033[32;1m%s\033[0m\n", "合集完成")
+
+	wgp.Wait()
+
+	if len(errs) > 0 {
+		return errs[0]
 	}
 	return nil
 }
