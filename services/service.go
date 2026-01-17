@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/mitchellh/mapstructure"
@@ -115,7 +116,26 @@ func NewService(co *CookieOptions) *Service {
 	// client.SetDebug(true)
 	client.SetBaseURL(baseURL).
 		SetCookies(cookies).
-		SetHeader("User-Agent", UserAgent)
+		SetHeader("User-Agent", UserAgent).
+		// 网络错误重试配置：10次重试，每次等待3秒
+		SetRetryCount(10).
+		SetRetryWaitTime(3 * time.Second).
+		SetRetryMaxWaitTime(30 * time.Second).
+		AddRetryCondition(func(r *resty.Response, err error) bool {
+			// 网络错误（DNS解析失败、连接超时等）时重试
+			if err != nil {
+				fmt.Printf("网络错误，3秒后重试: %v\n", err)
+				return true
+			}
+			// 服务端临时错误时重试
+			if r.StatusCode() == http.StatusBadGateway ||
+				r.StatusCode() == http.StatusServiceUnavailable ||
+				r.StatusCode() == http.StatusGatewayTimeout {
+				fmt.Printf("服务端错误 %d，3秒后重试\n", r.StatusCode())
+				return true
+			}
+			return false
+		})
 
 	return &Service{client: client}
 }
